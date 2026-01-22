@@ -478,6 +478,8 @@ struct globals {
 	IF_FEATURE_HTTPD_BASIC_AUTH(const char *g_realm;)
 	IF_FEATURE_HTTPD_BASIC_AUTH(char *remoteuser;)
 
+	pid_t parent_pid;
+
 	off_t file_size;        /* -1 - unknown */
 #if ENABLE_FEATURE_HTTPD_RANGES
 	off_t range_start;
@@ -556,6 +558,10 @@ enum {
 	file_size = -1; \
 } while (0)
 
+#define VERBOSE_1 (verbose)
+#define VERBOSE_2 (verbose > 1)
+/* TODO: make conditional on FEATURE_HTTPD_MAXVERBOSE */
+#define VERBOSE_3 (verbose > 2)
 
 #define STRNCASECMP(a, str) strncasecmp((a), (str), sizeof(str)-1)
 
@@ -1064,7 +1070,7 @@ static void log_and_exit(void)
 		continue;
 	*/
 
-	if (verbose > 2)
+	if (VERBOSE_3)
 		bb_simple_error_msg("closed");
 	_exit(xfunc_error_retval);
 }
@@ -1280,8 +1286,8 @@ static void send_headers(unsigned responseNum)
 		fprintf(stderr, "headers: '%s'\n", iobuf);
 	}
 	if (full_write(STDOUT_FILENO, iobuf, len) != len) {
-		if (verbose > 1)
-			bb_simple_perror_msg("error");
+		if (VERBOSE_1)
+			bb_simple_perror_msg("write error");
 		log_and_exit();
 	}
 }
@@ -1401,16 +1407,19 @@ static NOINLINE void cgi_io_loop_and_exit(int fromCgi_rd, int toCgi_wr, int post
 		/* Now wait on the set of sockets */
 		count = safe_poll(pfd, hdr_cnt > 0 ? TO_CGI+1 : FROM_CGI+1, -1);
 		if (count <= 0) {
-#if 0
-			if (safe_waitpid(pid, &status, WNOHANG) <= 0) {
-				/* Weird. CGI didn't exit and no fd's
-				 * are ready, yet poll returned?! */
-				continue;
+#if 0 /* This doesn't work since we SIG_IGNed SIGCHLD (which means kernel auto-reaps our children) */
+			if (VERBOSE_3) {
+				int status;
+				if (safe_waitpid(-1, &status, WNOHANG) <= 0) {
+					/* Weird. CGI didn't exit and no fd's
+					 * are ready, yet poll returned?! */
+					continue;
+				}
+				if (DEBUG && WIFEXITED(status))
+					bb_error_msg("CGI exited, status=%u", WEXITSTATUS(status));
+				if (DEBUG && WIFSIGNALED(status))
+					bb_error_msg("CGI killed, signal=%u", WTERMSIG(status));
 			}
-			if (DEBUG && WIFEXITED(status))
-				bb_error_msg("CGI exited, status=%u", WEXITSTATUS(status));
-			if (DEBUG && WIFSIGNALED(status))
-				bb_error_msg("CGI killed, signal=%u", WTERMSIG(status));
 #endif
 			break;
 		}
@@ -1644,7 +1653,8 @@ static void send_cgi_and_exit(
 
 	pid = vfork();
 	if (pid < 0) {
-		/* TODO: log perror? */
+		if (VERBOSE_1)
+			bb_simple_perror_msg("vfork");
 		log_and_exit();
 	}
 
@@ -1659,14 +1669,13 @@ static void send_cgi_and_exit(
 		close(fromCgi.rd);
 		xmove_fd(toCgi.rd, 0);  /* replace stdin with the pipe */
 		xmove_fd(fromCgi.wr, 1);  /* replace stdout with the pipe */
-		/* User seeing stderr output can be a security problem.
-		 * If CGI really wants that, it can always do dup itself. */
-		/* dup2(1, 2); */
 
 		/* Chdiring to script's dir */
 		script = last_slash;
 		if (script != url) { /* paranoia */
 			*script = '\0';
+			if (VERBOSE_3)
+				bb_error_msg("cd:%s", url + 1);
 			if (chdir_or_warn(url + 1) != 0) {
 				goto error_execing_cgi;
 			}
@@ -1696,13 +1705,20 @@ static void send_cgi_and_exit(
 			}
 		}
 #endif
-		/* restore default signal dispositions for CGI process */
+		if (VERBOSE_2)
+			bb_error_msg("exec:%s"IF_FEATURE_HTTPD_CONFIG_WITH_SCRIPT_INTERPR(" %s"),
+				argv[0]
+				IF_FEATURE_HTTPD_CONFIG_WITH_SCRIPT_INTERPR(, argv[1])
+			);
+		/* Restore default signal dispositions for CGI process */
 		bb_signals(0
 			| (1 << SIGCHLD)
 			| (1 << SIGPIPE)
-			| (1 << SIGHUP)
+			/*| (1 << SIGHUP) - not needed, we have a handler, and exec resets signals with handlers to DFL */
 			, SIG_DFL);
-
+		/* User seeing stderr output can be a security problem.
+		 * If CGI really wants that, it can always do dup itself. */
+		/* dup2(1, 2); */
 		/* _NOT_ execvp. We do not search PATH. argv[0] is a filename
 		 * without any dir components and will only match a file
 		 * in the current directory */
@@ -1894,7 +1910,9 @@ static NOINLINE void send_file_and_exit(const char *url, int what)
 			if (count < 0) {
 				if (offset == range_start) /* was it the very 1st sendfile? */
 					break; /* fall back to read/write loop */
-				goto fin;
+				if (VERBOSE_1)
+					bb_simple_perror_msg("sendfile error");
+				log_and_exit();
 			}
 			IF_FEATURE_HTTPD_RANGES(range_len -= count;)
 			if (count == 0 || range_len == 0)
@@ -1913,9 +1931,8 @@ static NOINLINE void send_file_and_exit(const char *url, int what)
 			break;
 	}
 	if (count < 0) {
- IF_FEATURE_USE_SENDFILE(fin:)
-		if (verbose > 1)
-			bb_simple_perror_msg("error");
+		if (VERBOSE_1)
+			bb_simple_perror_msg("read error");
 	}
 	log_and_exit();
 }
@@ -2222,7 +2239,7 @@ static void handle_incoming_and_exit(const len_and_sockaddr *fromAddr)
 		/* this trick makes -v logging much simpler */
 		if (rmt_ip_str)
 			applet_name = rmt_ip_str;
-		if (verbose > 2)
+		if (VERBOSE_3)
 			bb_simple_error_msg("connected");
 	}
 #if ENABLE_FEATURE_HTTPD_ACL_IP
@@ -2250,7 +2267,7 @@ static void handle_incoming_and_exit(const len_and_sockaddr *fromAddr)
 		 * being sent at all.
 		 * (Presumably it's a method to decrease latency?)
 		 */
-		if (verbose > 2)
+		if (VERBOSE_3)
 			bb_simple_error_msg("eof on read, closing");
 		/* Don't bother generating error page in this case,
 		 * just close the socket.
@@ -2283,7 +2300,7 @@ static void handle_incoming_and_exit(const len_and_sockaddr *fromAddr)
 		int proxy_fd;
 		len_and_sockaddr *lsa;
 
-		if (verbose > 1)
+		if (VERBOSE_2)
 			bb_error_msg("proxy:%s", urlp);
 		lsa = host2sockaddr(proxy_entry->host_port, 80);
 		if (!lsa)
@@ -2383,7 +2400,7 @@ static void handle_incoming_and_exit(const len_and_sockaddr *fromAddr)
 	}
 
 	/* Log it */
-	if (verbose > 1)
+	if (VERBOSE_2)
 		bb_error_msg("url:%s", urlcopy);
 
 	tptr = urlcopy;
@@ -2636,6 +2653,7 @@ static void handle_incoming_and_exit(const len_and_sockaddr *fromAddr)
 static void mini_httpd(int server_socket) NORETURN;
 static void mini_httpd(int server_socket)
 {
+	xmove_fd(server_socket, 0);
 	/* NB: it's best to not use xfuncs in this loop before fork().
 	 * Otherwise server may die on transient errors (temporary
 	 * out-of-memory condition, etc), which is Bad(tm).
@@ -2647,7 +2665,7 @@ static void mini_httpd(int server_socket)
 
 		/* Wait for connections... */
 		fromAddr.len = LSA_SIZEOF_SA;
-		n = accept(server_socket, &fromAddr.u.sa, &fromAddr.len);
+		n = accept(0, &fromAddr.u.sa, &fromAddr.len);
 		if (n < 0)
 			continue;
 //TODO: we can reject connects from denied IPs right away;
@@ -2664,8 +2682,8 @@ static void mini_httpd(int server_socket)
 		if (fork() == 0) {
 			/* child */
 			/* Do not reload config on HUP */
-			signal(SIGHUP, SIG_IGN);
-			close(server_socket);
+			/*signal(SIGHUP, SIG_IGN); - not needed, handler is a NOP in children (checks pid) */
+			/* close(0); - server socket. The next line does this for free */
 			xmove_fd(n, 0);
 			xdup2(0, 1);
 
@@ -2686,6 +2704,7 @@ static void mini_httpd_nommu(int server_socket, int argc, char **argv)
 	argv_copy[1] = (char*)"-i";
 	memcpy(&argv_copy[2], &argv[1], argc * sizeof(argv[0]));
 
+	xmove_fd(server_socket, 0);
 	/* NB: it's best to not use xfuncs in this loop before vfork().
 	 * Otherwise server may die on transient errors (temporary
 	 * out-of-memory condition, etc), which is Bad(tm).
@@ -2695,7 +2714,7 @@ static void mini_httpd_nommu(int server_socket, int argc, char **argv)
 		int n;
 
 		/* Wait for connections... */
-		n = accept(server_socket, NULL, NULL);
+		n = accept(0, NULL, NULL);
 		if (n < 0)
 			continue;
 
@@ -2705,8 +2724,8 @@ static void mini_httpd_nommu(int server_socket, int argc, char **argv)
 		if (vfork() == 0) {
 			/* child */
 			/* Do not reload config on HUP */
-			signal(SIGHUP, SIG_IGN);
-			close(server_socket);
+			/*signal(SIGHUP, SIG_IGN); - not needed, handler is a NOP in children (checks pid) */
+			/* close(0); - server socket. The next line does this for free */
 			xmove_fd(n, 0);
 			xdup2(0, 1);
 
@@ -2739,9 +2758,11 @@ static void mini_httpd_inetd(void)
 
 static void sighup_handler(int sig UNUSED_PARAM)
 {
-	int sv = errno;
-	parse_conf(DEFAULT_PATH_HTTPD_CONF, SIGNALED_PARSE);
-	errno = sv;
+	if (G.parent_pid == getpid()) {
+		int sv = errno;
+		parse_conf(DEFAULT_PATH_HTTPD_CONF, SIGNALED_PARSE);
+		errno = sv;
+	}
 }
 
 enum {
@@ -2850,7 +2871,9 @@ int httpd_main(int argc UNUSED_PARAM, char **argv)
 		xchdir(home_httpd);
 
 	if (!(opt & OPT_INETD)) {
+		/* Make it unnecessary to wait for children */
 		signal(SIGCHLD, SIG_IGN);
+
 		server_socket = openServer();
 #if ENABLE_FEATURE_HTTPD_SETUID
 		/* drop privileges */
@@ -2884,8 +2907,10 @@ int httpd_main(int argc UNUSED_PARAM, char **argv)
 #endif
 
 	parse_conf(DEFAULT_PATH_HTTPD_CONF, FIRST_PARSE);
-	if (!(opt & OPT_INETD))
+	if (!(opt & OPT_INETD)) {
+		G.parent_pid = getpid();
 		signal(SIGHUP, sighup_handler);
+	}
 
 	xfunc_error_retval = 0;
 	if (opt & OPT_INETD)
