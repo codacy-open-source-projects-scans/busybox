@@ -268,6 +268,7 @@
 //usage:       " [-c CONFFILE]"
 //usage:       " [-p [IP:]PORT]"
 //usage:       " [-M MAXCONN]"
+//usage:	IF_FEATURE_HTTPD_CGI(" [-K KILLSEC]")
 //usage:	IF_FEATURE_HTTPD_SETUID(" [-u USER[:GRP]]")
 //usage:	IF_FEATURE_HTTPD_BASIC_AUTH(" [-r REALM]")
 //usage:       " [-h HOME]\n"
@@ -279,6 +280,8 @@
 //usage:     "\n	-v[v]		Verbose"
 //usage:     "\n	-p [IP:]PORT	Bind to IP:PORT (default *:"STR(CONFIG_FEATURE_HTTPD_PORT_DEFAULT)")"
 //usage:     "\n	-M NUM		Pause if NUM connections are open (default 256)"
+//usage:	IF_FEATURE_HTTPD_CGI(
+//usage:     "\n	-K NUM		Kill CGIs after NUM seconds")
 //usage:	IF_FEATURE_HTTPD_SETUID(
 //usage:     "\n	-u USER[:GRP]	Set uid/gid after binding to port")
 //usage:	IF_FEATURE_HTTPD_BASIC_AUTH(
@@ -299,6 +302,10 @@
  *   (HEADER_READ_TIMEOUT)
  * - if client stops consuming its result ("stalled receiver" attack),
  *   the server will drop the connection (DATA_WRITE_TIMEOUT)
+ * - POSTDATA for POST method to CGI must arrive at least once
+ *   per DATA_READ_TIMEOUT
+ * - killing CGIs which are obviously stuck if -K 60:
+ *   "if CGI isn't done in 1 minute, it's fishy. SIGTERM+SIGKILL"
  *
  * To limit the number of simultaneously running CGI children,
  * you may use the helper tool, httpd_ratelimit_cgi.c:
@@ -309,9 +316,13 @@
  *
  * TODO:
  * - do not allow all MAXCONN connections be taken up by the same remote IP.
+ * - sanity: add a limit how big POSTDATA can be? (-P 1024: "megabyte+ of POSTDATA is insanity")
+ *   currently we only do: if (POST_length > INT_MAX) HTTP_BAD_REQUEST
+ * - sanity: measure CGI memory consumption (how?), kill when way too big?
  */
 #define HEADER_READ_TIMEOUT 30
 #define DATA_WRITE_TIMEOUT  60
+#define DATA_READ_TIMEOUT   60
 
 
 #include "libbb.h"
@@ -477,7 +488,11 @@ struct globals {
 	smallint flg_deny_all;
 #if ENABLE_FEATURE_HTTPD_GZIP
 	/* client can handle gzip / we are going to send gzip */
+	smallint accept_gzip;
 	smallint content_gzip;
+#endif
+#if ENABLE_FEATURE_HTTPD_CGI
+	smallint cgi_output;
 #endif
 	time_t last_mod;
 #if ENABLE_FEATURE_HTTPD_ETAG
@@ -522,6 +537,13 @@ struct globals {
 #define sizeof_hdr_buf COMMON_BUFSIZE
 	char *hdr_ptr;
 	int hdr_cnt;
+#if ENABLE_FEATURE_HTTPD_CGI || ENABLE_FEATURE_HTTPD_PROXY
+	int POST_len;
+#endif
+#if ENABLE_FEATURE_HTTPD_CGI
+	unsigned cgi_kill_timeout;
+	pid_t cgi_pid;
+#endif
 #if ENABLE_FEATURE_HTTPD_ETAG
 	char etag[sizeof("'%llx-%llx'") + 2 * sizeof(long long)*3];
 #endif
@@ -531,14 +553,16 @@ struct globals {
 #if ENABLE_FEATURE_HTTPD_PROXY
 	Htaccess_Proxy *proxy;
 #endif
-	char iobuf[IOBUF_SIZE];
+	char iobuf[IOBUF_SIZE] ALIGN8;
 };
 #define G (*ptr_to_globals)
 #define verbose           (G.verbose          )
 #define flg_deny_all      (G.flg_deny_all     )
 #if ENABLE_FEATURE_HTTPD_GZIP
+# define accept_gzip      (G.accept_gzip      )
 # define content_gzip     (G.content_gzip     )
 #else
+# define accept_gzip      0
 # define content_gzip     0
 #endif
 #define bind_addr_or_port (G.bind_addr_or_port)
@@ -1091,7 +1115,7 @@ static void log_and_exit(void)
 {
 	if (VERBOSE_3)
 		bb_simple_error_msg("closed");
-	_exit(xfunc_error_retval);
+	_exit_SUCCESS();
 }
 static void send_EOF_and_exit(void) NORETURN;
 static void send_EOF_and_exit(void)
@@ -1380,8 +1404,8 @@ static unsigned get_line(void)
 #if ENABLE_FEATURE_HTTPD_CGI || ENABLE_FEATURE_HTTPD_PROXY
 
 /* gcc 4.2.1 fares better with NOINLINE */
-static NOINLINE void cgi_io_loop_and_exit(int fromCgi_rd, int toCgi_wr, int post_len) NORETURN;
-static NOINLINE void cgi_io_loop_and_exit(int fromCgi_rd, int toCgi_wr, int post_len)
+static NOINLINE void cgi_io_loop_and_exit(int fromCgi_rd, int toCgi_wr) NORETURN;
+static NOINLINE void cgi_io_loop_and_exit(int fromCgi_rd, int toCgi_wr)
 {
 	enum { FROM_CGI = 1, TO_CGI = 2 }; /* indexes in pfd[] */
 	struct pollfd pfd[3];
@@ -1395,12 +1419,14 @@ static NOINLINE void cgi_io_loop_and_exit(int fromCgi_rd, int toCgi_wr, int post
 	// is coming than we expected. We may give *some part* of that
 	// extra data to CGI.
 
-	//if (hdr_cnt > post_len) {
+	/* We often have the start of POSTDATA buffered in hdr_buf already
+	 * by the header lines reading logic */
+	//if (hdr_cnt > G.POST_len) {
 	//	/* We got more POSTDATA from network than we expected */
-	//	hdr_cnt = post_len;
+	//	hdr_cnt = G.POST_len;
 	//}
-	post_len -= hdr_cnt;
-	/* post_len - number of POST bytes not yet read from network */
+	G.POST_len -= hdr_cnt;
+	//bb_error_msg("G.POST_len:%d", G.POST_len);
 
 	/* NB: breaking out of this loop jumps to log_and_exit() */
 	out_cnt = 0;
@@ -1419,28 +1445,37 @@ static NOINLINE void cgi_io_loop_and_exit(int fromCgi_rd, int toCgi_wr, int post
 		/*pfd[FROM_CGI].events = POLLIN; - moved out of loop */
 		/*pfd[FROM_CGI].revents = 0; - not needed */
 
-		/* gcc-4.8.0 still doesnt fill two shorts with one insn :( */
+		/* gcc-4.8.0 still doesn't fill two shorts with one insn :( */
 		/* http://gcc.gnu.org/bugzilla/show_bug.cgi?id=47059 */
 		/* hopefully one day it will... */
 		pfd[TO_CGI].events = POLLOUT;
 		pfd[TO_CGI].revents = 0; /* needed! */
 
 		if (toCgi_wr && hdr_cnt <= 0) {
-			if (post_len > 0) {
+			if (G.POST_len > 0) {
 				/* Expect more POST data from network */
 				pfd[0].fd = 0;
+				/* Kill ourselves if no data arrives in N seconds */
+				alarm(DATA_READ_TIMEOUT);
 			} else {
-				/* post_len <= 0 && hdr_cnt <= 0:
+				/* G.POST_len <= 0 && hdr_cnt <= 0:
 				 * no more POST data to CGI,
 				 * let CGI see EOF on CGI's stdin */
-				if (toCgi_wr != fromCgi_rd)
+				if (!ENABLE_FEATURE_HTTPD_PROXY || (toCgi_wr != fromCgi_rd)) {
 					close(toCgi_wr);
+					alarm(G.cgi_kill_timeout);
+				} else {
+					/* proxying a socket, there is no CGI */
+					alarm(0);
+				}
 				toCgi_wr = 0;
 			}
 		}
 
 		/* Now wait on the set of sockets */
+		/* Poll whether TO_CGI is ready to accept writes *only* if we have some POSTDATA to give to it */
 		count = safe_poll(pfd, hdr_cnt > 0 ? TO_CGI+1 : FROM_CGI+1, -1);
+
 		if (count <= 0) {
 #if 0 /* This doesn't work since we SIG_IGNed SIGCHLD (which means kernel auto-reaps our children) */
 			if (VERBOSE_3) {
@@ -1472,80 +1507,92 @@ static NOINLINE void cgi_io_loop_and_exit(int fromCgi_rd, int toCgi_wr, int post
 				hdr_cnt -= count;
 			} else {
 				/* EOF/broken pipe to CGI, stop piping POST data */
-				hdr_cnt = post_len = 0;
+				hdr_cnt = G.POST_len = 0;
 			}
 		}
-
+		else /* After one poll(), we either write to CGI, or read from network. Never both */
 		if (pfd[0].revents) {
-			/* post_len > 0 && hdr_cnt == 0 here */
+			/* G.POST_len > 0 && hdr_cnt == 0 here */
 			/* We expect data, prev data portion is eaten by CGI
-			 * and there *is* data to read from the peer
-			 * (POSTDATA) */
-			//count = post_len > (int)sizeof_hdr_buf ? (int)sizeof_hdr_buf : post_len;
+			 * and there *is* POSTDATA to read from the peer
+			 */
+			//count = G.POST_len > (int)sizeof_hdr_buf ? (int)sizeof_hdr_buf : G.POST_len;
 			//count = safe_read(STDIN_FILENO, hdr_buf, count);
 			count = safe_read(STDIN_FILENO, hdr_buf, sizeof_hdr_buf);
 			if (count > 0) {
 				hdr_cnt = count;
 				hdr_ptr = hdr_buf;
-				post_len -= count;
+				G.POST_len -= count; /* can go negative (peer wrote more than expected POSTDATA) */
 			} else {
 				/* no more POST data can be read */
-				post_len = 0;
+				G.POST_len = 0;
 			}
 		}
 
 		if (pfd[FROM_CGI].revents) {
 			/* There is something to read from CGI */
-			char *rbuf = iobuf;
-
-			/* Are we still buffering CGI output? */
+			/* Still buffering CGI output? */
 			if (out_cnt >= 0) {
 				/* HTTP_200[] has single "\r\n" at the end.
 				 * According to http://hoohoo.ncsa.uiuc.edu/cgi/out.html,
 				 * CGI scripts MUST send their own header terminated by
 				 * empty line, then data. That's why we have only one
 				 * <cr><lf> pair here. We will output "200 OK" line
-				 * if needed, but CGI still has to provide blank line
+				 * if needed, but CGI still has to provide the blank line
 				 * between header and body */
 
 				/* Must use safe_read, not full_read, because
 				 * CGI may output a few first bytes and then wait
 				 * for POSTDATA without closing stdout.
 				 * With full_read we may wait here forever. */
-				count = safe_read(fromCgi_rd, rbuf + out_cnt, IOBUF_SIZE - 8);
+				count = safe_read(fromCgi_rd, iobuf + out_cnt, IOBUF_SIZE - 8);
+// "- 8" is important, out_cnt can be up to 7
 				if (count <= 0) {
-					/* eof (or error) and there was no "HTTP",
-					 * send "HTTP/1.1 200 OK\r\n", then send received data */
-					if (out_cnt) {
-						full_write(STDOUT_FILENO, HTTP_200, sizeof(HTTP_200)-1);
-						full_write(STDOUT_FILENO, rbuf, out_cnt);
-					}
-					send_EOF_and_exit(); /* CGI stdout is closed, exiting */
+					/* EOF (or error, and out_cnt=0..7
+					 * send "HTTP/1.1 200 OK\r\n", then send received 0..7 bytes */
+					goto write_HTTP_200_OK;
+					/* we'll read once more later, in "no longer buffering"
+					 * code path, get another EOF there and exit */
 				}
 				out_cnt += count;
 				count = 0;
-				/* "Status" header format is: "Status: 302 Redirected\r\n" */
-				if (out_cnt >= 8 && memcmp(rbuf, "Status: ", 8) == 0) {
-					/* send "HTTP/1.1 " */
-					if (full_write(STDOUT_FILENO, HTTP_200, 9) != 9)
-						break;
-					/* skip "Status: " (including space, sending "HTTP/1.1  NNN" is wrong) */
-					rbuf += 8;
-					count = out_cnt - 8;
-					out_cnt = -1; /* buffering off */
-				} else if (out_cnt >= 4) {
-					/* Did CGI add "HTTP"? */
-					if (memcmp(rbuf, HTTP_200, 4) != 0) {
-						/* there is no "HTTP", do it ourself */
+				if (out_cnt >= 8) {
+//FIXME: "Status: " is not required to be the first header! It can be anywhere!
+//FIXME: many servers also check "Location: ". If it exists but "Status: " does _not_, "302 Found" is assumed instead of "200 OK".
+					uint64_t str8 = *(uint64_t*)iobuf;
+					//bb_error_msg("from cgi:'%.*s'", out_cnt, iobuf);
+
+					/* "Status" header format is: "Status: 302 Redirected\r\n" */
+					//if (memcmp(iobuf, "Status: ", 8) == 0)
+					if (str8 == PACK64_LITERAL_STR("Status: ")) {
+						/* Replace "Status: " */
+						/* with    "HTTP/1.1 " */
+						memmove(iobuf + 1, iobuf, out_cnt);
+						out_cnt += 1;
+						memcpy(iobuf, HTTP_200, 9);
+						if (verbose) {
+							char *end = iobuf + 9;
+							int cnt = out_cnt - 9;
+							while ((unsigned char)*end >= ' ' && (unsigned char)*end < 0x7f && cnt > 0)
+								end++, cnt--;
+							bb_error_msg("cgi response:'%.*s'", (int)(end - (iobuf + 9)), iobuf + 9);
+						}
+					}
+//NB: Apache has no such autodetection. It always adds its own HTTP/1.x header,
+//unless the CGI name starts with "nph-", in which case it passes its output verbatim to network.
+					else /* Did CGI send "HTTP/1.1"? */
+					//if (memcmp(iobuf, HTTP_200, 8) != 0)
+					if (str8 != PACK64_LITERAL_STR(HTTP_200)) {
+ write_HTTP_200_OK:
+						/* no, send "HTTP/1.1 200 OK\r\n" ourself */
 						if (full_write(STDOUT_FILENO, HTTP_200, sizeof(HTTP_200)-1) != sizeof(HTTP_200)-1)
 							break;
+						if (verbose)
+							bb_error_msg("cgi response:%u", 200);
 					}
-					/* Commented out:
-					if (!strstr(rbuf, "ontent-")) {
-						full_write(s, "Content-type: text/plain\r\n\r\n", 28);
-					}
-					 * Counter-example of valid CGI without Content-type:
-					 * echo -en "HTTP/1.1 302 Found\r\n"
+					/* Used to add "Content-type: text/plain\r\n\r\n" here if CGI didn't,
+					 * but it's wrong. Counter-example of valid CGI without Content-type:
+					 * echo -en "Status: 302 Found\r\n"
 					 * echo -en "Location: http://www.busybox.net\r\n"
 					 * echo -en "\r\n"
 					 */
@@ -1553,13 +1600,15 @@ static NOINLINE void cgi_io_loop_and_exit(int fromCgi_rd, int toCgi_wr, int post
 					out_cnt = -1; /* buffering off */
 				}
 			} else {
-				count = safe_read(fromCgi_rd, rbuf, IOBUF_SIZE);
+				count = safe_read(fromCgi_rd, iobuf, IOBUF_SIZE);
 				if (count <= 0)
-					send_EOF_and_exit();  /* eof (or error) */
+					send_EOF_and_exit();  /* EOF (or error) */
 			}
-			if (full_write(STDOUT_FILENO, rbuf, count) != count)
+			IF_FEATURE_HTTPD_CGI(G.cgi_output = 1;)
+//FIXME: many (most?) servers translate bare "\n" to "\r\n", only in the headers, not body (the part after empty line)
+			if (full_write(STDOUT_FILENO, iobuf, count) != count)
 				break;
-			dbg("cgi read %d bytes: '%.*s'\n", count, count, rbuf);
+			dbg("cgi read %d bytes: '%.*s'\n", count, count, iobuf);
 		} /* if (pfd[FROM_CGI].revents) */
 	} /* while (1) */
 	log_and_exit();
@@ -1583,23 +1632,19 @@ static void setenv1(const char *name, const char *value)
  * Parameters:
  * const char *url              The requested URL (with leading /).
  * const char *orig_uri         The original URI before rewriting (if any)
- * int post_len                 Length of the POST body.
  */
 static void send_cgi_and_exit(
 		const char *url,
 		const char *orig_uri,
-		const char *request,
-		int post_len) NORETURN;
+		const char *request) NORETURN;
 static void send_cgi_and_exit(
 		const char *url,
 		const char *orig_uri,
-		const char *request,
-		int post_len)
+		const char *request)
 {
 	struct fd_pair fromCgi;  /* CGI -> httpd pipe */
 	struct fd_pair toCgi;    /* httpd -> CGI pipe */
 	char *script, *last_slash;
-	int pid;
 
 	/* Make a copy. NB: caller guarantees:
 	 * url[0] == '/', url[1] != '/' */
@@ -1672,8 +1717,8 @@ static void send_cgi_and_exit(
 #endif
 		}
 	}
-	if (post_len)
-		putenv(xasprintf("CONTENT_LENGTH=%u", post_len));
+	if (G.POST_len > 0)
+		putenv(xasprintf("CONTENT_LENGTH=%u", G.POST_len));
 #if ENABLE_FEATURE_HTTPD_BASIC_AUTH
 	if (remoteuser) {
 		setenv1("REMOTE_USER", remoteuser);
@@ -1686,18 +1731,19 @@ static void send_cgi_and_exit(
 	xpiped_pair(fromCgi);
 	xpiped_pair(toCgi);
 
-	pid = vfork();
-	if (pid < 0) {
+	G.cgi_pid = vfork();
+	if (G.cgi_pid < 0) {
 		if (VERBOSE_1)
 			bb_simple_perror_msg("vfork");
 		log_and_exit();
 	}
 
-	if (pid == 0) {
+	if (G.cgi_pid == 0) {
 		/* Child process */
 		char *argv[3];
 
-		xfunc_error_retval = 242;
+		/* -K SECS kills entire process group: set up one */
+		bb_setpgrp();
 
 		/* NB: close _first_, then move fds! */
 		close(toCgi.wr);
@@ -1763,18 +1809,18 @@ static void send_cgi_and_exit(
  error_execing_cgi:
 		/* send to stdout
 		 * (we are CGI here, our stdout is pumped to the net) */
-		send_headers_and_exit(HTTP_NOT_FOUND);
+		//send_headers_and_exit(HTTP_NOT_FOUND);
+		//^^^ WRONG, this logs "closed", then the parent logs it again
+		send_headers(HTTP_NOT_FOUND);
+		_exit_FAILURE();
 	} /* end child */
 
 	/* Parent process */
 
-	/* Restore variables possibly changed by child */
-	xfunc_error_retval = 0;
-
 	/* Pump data */
 	close(fromCgi.wr);
 	close(toCgi.rd);
-	cgi_io_loop_and_exit(fromCgi.rd, toCgi.wr, post_len);
+	cgi_io_loop_and_exit(fromCgi.rd, toCgi.wr);
 }
 
 #endif          /* FEATURE_HTTPD_CGI */
@@ -1792,7 +1838,8 @@ static NOINLINE void send_file_and_exit(const char *url, int what)
 	int fd;
 	ssize_t count;
 
-	if (content_gzip) {
+#if ENABLE_FEATURE_HTTPD_GZIP
+	if (accept_gzip) {
 		/* does <url>.gz exist? Then use it instead */
 		char *gzurl = xasprintf("%s.gz", url);
 		fd = open(gzurl, O_RDONLY);
@@ -1802,11 +1849,13 @@ static NOINLINE void send_file_and_exit(const char *url, int what)
 			fstat(fd, &sb);
 			file_size = sb.st_size;
 			last_mod = sb.st_mtime;
+			content_gzip = 1;
 		} else {
-			IF_FEATURE_HTTPD_GZIP(content_gzip = 0;)
 			fd = open(url, O_RDONLY);
 		}
-	} else {
+	} else
+#endif
+	{
 		fd = open(url, O_RDONLY);
 		/* file_size and last_mod are already populated */
 	}
@@ -2230,16 +2279,27 @@ static Htaccess_Proxy *find_proxy_entry(const char *url)
 /*
  * Handle timeouts
  */
-static void send_REQUEST_TIMEOUT_and_exit(int sig) NORETURN;
-static void send_REQUEST_TIMEOUT_and_exit(int sig UNUSED_PARAM)
+static void sigalrm_handler(int sig) NORETURN;
+static void sigalrm_handler(int sig UNUSED_PARAM)
 {
-	/* timed out reading headers */
-	send_headers_and_exit(HTTP_REQUEST_TIMEOUT);
-//If we'd use alarm() for write timeouts too:
-//	/* writing timed out: exit without writing anything */
-//	if (VERBOSE_3)
-//		bb_simple_error_msg("write timeout");
-//	_exit(xfunc_error_retval);
+	/* timed out reading headers, POSTDATA, or CGI runs too long */
+	int response = HTTP_REQUEST_TIMEOUT;
+#if ENABLE_FEATURE_HTTPD_CGI
+	if (G.cgi_pid > 0) {
+		if (kill(-G.cgi_pid, SIGTERM) == 0) {
+			bb_error_msg("kill cgi:%d", G.cgi_pid);
+			sleep1();
+			kill(-G.cgi_pid, SIGKILL);
+		}
+		/* Browsers were seen retrying if got HTTP_REQUEST_TIMEOUT,
+		 * we don't want that for the case of stuck CGI. */
+		response = HTTP_INTERNAL_SERVER_ERROR;
+	}
+#endif
+	IF_FEATURE_HTTPD_CGI(if (!G.cgi_output))
+		send_headers_and_exit(response);
+	/* else: we already have some output, do not garble it with HTTP response */
+	log_and_exit();
 }
 
 static void prepare_write_timeout(void)
@@ -2276,7 +2336,6 @@ static void handle_incoming_and_exit(const len_and_sockaddr *fromAddr)
 	static const char request_HEAD[] ALIGN1 = "HEAD";
 #if ENABLE_FEATURE_HTTPD_CGI
 	static const char request_POST[] ALIGN1 = "POST";
-	unsigned long POST_length;
 	enum CGI_type {
 		CGI_NONE = 0,
 		CGI_NORMAL,
@@ -2334,7 +2393,7 @@ static void handle_incoming_and_exit(const len_and_sockaddr *fromAddr)
 		 * just close the socket.
 		 */
 		//send_headers_and_exit(HTTP_BAD_REQUEST);
-		_exit(xfunc_error_retval);
+		_exit_SUCCESS();
 	}
 	dbg("Request:'%s'\n", iobuf);
 
@@ -2387,7 +2446,8 @@ static void handle_incoming_and_exit(const len_and_sockaddr *fromAddr)
 		/* The above also allows http2 which starts with a fixed
 		 * "PRI * HTTP/2.0" line
 		 */
-		cgi_io_loop_and_exit(proxy_fd, proxy_fd, /*max POST length:*/ INT_MAX);
+		G.POST_len = INT_MAX; /* hack */
+		cgi_io_loop_and_exit(proxy_fd, proxy_fd);
 	}
 #endif
 	/* We don't support http2 "*" URI, enforce "/URI" form */
@@ -2470,7 +2530,7 @@ static void handle_incoming_and_exit(const len_and_sockaddr *fromAddr)
 
 	/* Log it */
 	if (VERBOSE_2)
-		bb_error_msg("url:%s", urlcopy);
+		bb_error_msg("%s %s", prequest, urlcopy);
 
 	tptr = urlcopy;
 	while ((tptr = strchr(tptr + 1, '/')) != NULL) {
@@ -2545,7 +2605,6 @@ static void handle_incoming_and_exit(const len_and_sockaddr *fromAddr)
 
 #if ENABLE_FEATURE_HTTPD_CGI
 	total_headers_len = 0;
-	POST_length = 0;
 #endif
 
 	/* Read until blank line */
@@ -2567,9 +2626,9 @@ static void handle_incoming_and_exit(const len_and_sockaddr *fromAddr)
 			if (!tptr[0])
 				send_headers_and_exit(HTTP_BAD_REQUEST);
 			/* not using strtoul: it ignores leading minus! */
-			POST_length = bb_strtou(tptr, NULL, 10);
-			/* length is "ulong", but we need to pass it to int later */
-			if (errno || POST_length > INT_MAX)
+			G.POST_len = (int)bb_strtou(tptr, NULL, 10);
+			/* we need to pass it to int later */
+			if (errno || G.POST_len < 0)
 				send_headers_and_exit(HTTP_BAD_REQUEST);
 			continue;
 		}
@@ -2620,7 +2679,7 @@ static void handle_incoming_and_exit(const len_and_sockaddr *fromAddr)
 				// || s[-1] == ','
 				// || s[-1] == ':'
 				//) {
-					content_gzip = 1;
+					accept_gzip = 1;
 				//}
 			}
 			continue;
@@ -2688,7 +2747,7 @@ static void handle_incoming_and_exit(const len_and_sockaddr *fromAddr)
 		send_cgi_and_exit(
 			(cgi_type == CGI_INDEX) ? "/cgi-bin/index.cgi"
 			/*CGI_NORMAL or CGI_INTERPRETER*/ : urlcopy,
-			urlcopy, prequest, POST_length
+			urlcopy, prequest
 		);
 	}
 #endif
@@ -2775,7 +2834,7 @@ static void mini_httpd(int server_socket)
 {
 	int countdown;
 
-	signal(SIGALRM, send_REQUEST_TIMEOUT_and_exit);
+	signal(SIGALRM, sigalrm_handler);
 
 	xmove_fd(server_socket, 0);
 	/* NB: it's best to not use xfuncs in this loop before fork().
@@ -2833,7 +2892,7 @@ static void mini_httpd_nommu(int server_socket, int argc, char **argv)
 	argv_copy[1] = (char*)"-i";
 	memcpy(&argv_copy[2], &argv[1], argc * sizeof(argv[0]));
 
-	/*signal(SIGALRM, send_REQUEST_TIMEOUT_and_exit);*/
+	/*signal(SIGALRM, sigalrm_handler);*/
 	/* ^^^ WRONG. mini_httpd_inetd() does this */
 
 	xmove_fd(server_socket, 0);
@@ -2885,7 +2944,7 @@ static void mini_httpd_inetd(void)
 {
 	len_and_sockaddr fromAddr;
 
-	signal(SIGALRM, send_REQUEST_TIMEOUT_and_exit);
+	signal(SIGALRM, sigalrm_handler);
 
 	memset(&fromAddr, 0, sizeof(fromAddr));
 	fromAddr.len = LSA_SIZEOF_SA;
@@ -2913,6 +2972,7 @@ enum {
 	IF_FEATURE_HTTPD_SETUID(        u_opt_setuid    ,)
 	p_opt_port      ,
 	M_opt_maxconn   ,
+	K_opt_killcgi   ,
 	i_opt_inetd     ,
 	f_opt_foreground,
 	v_opt_verbose   ,
@@ -2940,7 +3000,12 @@ int httpd_main(int argc UNUSED_PARAM, char **argv)
 	IF_FEATURE_HTTPD_SETUID(const char *s_ugid = NULL;)
 	IF_FEATURE_HTTPD_SETUID(struct bb_uidgid_t ugid;)
 	IF_FEATURE_HTTPD_AUTH_MD5(const char *pass;)
-
+#if 0 // PACK64_LITERAL_STR test
+	char testing[16] = "Status: ";
+	printf("0x%08llx\n", PACK64_LITERAL_STR("Status: "));
+	printf("0x%08llx\n", *(uint64_t*)testing);
+	exit(1);
+#endif
 	INIT_G();
 
 #if ENABLE_LOCALE_SUPPORT
@@ -2959,7 +3024,7 @@ int httpd_main(int argc UNUSED_PARAM, char **argv)
 			IF_FEATURE_HTTPD_BASIC_AUTH("r:")
 			IF_FEATURE_HTTPD_AUTH_MD5("m:")
 			IF_FEATURE_HTTPD_SETUID("u:")
-			"p:M:+ifv"
+			"p:M:+K:+ifv"
 			"\0"
 			/* -v counts, -i implies -f */
 			"vv:if",
@@ -2970,6 +3035,7 @@ int httpd_main(int argc UNUSED_PARAM, char **argv)
 			IF_FEATURE_HTTPD_SETUID(, &s_ugid)
 			, &bind_addr_or_port
 			, &G.conn_limit
+			, IF_FEATURE_HTTPD_CGI(&G.cgi_kill_timeout) IF_NOT_FEATURE_HTTPD_CGI(NULL)
 			, &verbose
 		);
 	if (opt & OPT_DECODE_URL) {
