@@ -484,7 +484,6 @@ static const struct {
 };
 
 struct globals {
-	int verbose;            /* must be int (used by getopt32) */
 	smallint flg_deny_all;
 #if ENABLE_FEATURE_HTTPD_GZIP
 	/* client can handle gzip / we are going to send gzip */
@@ -494,6 +493,7 @@ struct globals {
 #if ENABLE_FEATURE_HTTPD_CGI
 	smallint cgi_output;
 #endif
+	int verbose;            /* must be int (used by getopt32) */
 	time_t last_mod;
 #if ENABLE_FEATURE_HTTPD_ETAG
 	char *if_none_match;
@@ -512,9 +512,6 @@ struct globals {
 	Htaccess_IP *ip_a_d;    /* config allow/deny lines */
 #endif
 
-	IF_FEATURE_HTTPD_BASIC_AUTH(const char *g_realm;)
-	IF_FEATURE_HTTPD_BASIC_AUTH(char *remoteuser;)
-
 	pid_t parent_pid;
 	int children_fd;
 	int conn_limit;
@@ -527,14 +524,14 @@ struct globals {
 #endif
 
 #if ENABLE_FEATURE_HTTPD_BASIC_AUTH
+	const char *g_realm;
+	char *remoteuser;
 	Htaccess *g_auth;       /* config user:password lines */
 #endif
 	Htaccess *mime_a;       /* config mime types */
 #if ENABLE_FEATURE_HTTPD_CONFIG_WITH_SCRIPT_INTERPR
 	Htaccess *script_i;     /* config script interpreters */
 #endif
-#define        hdr_buf bb_common_bufsiz1
-#define sizeof_hdr_buf COMMON_BUFSIZE
 	char *hdr_ptr;
 	int hdr_cnt;
 #if ENABLE_FEATURE_HTTPD_CGI || ENABLE_FEATURE_HTTPD_PROXY
@@ -544,9 +541,6 @@ struct globals {
 	unsigned cgi_kill_timeout;
 	pid_t cgi_pid;
 #endif
-#if ENABLE_FEATURE_HTTPD_ETAG
-	char etag[sizeof("'%llx-%llx'") + 2 * sizeof(long long)*3];
-#endif
 #if ENABLE_FEATURE_HTTPD_ERROR_PAGES
 	const char *http_error_page[ARRAY_SIZE(http_response_type)];
 #endif
@@ -554,8 +548,18 @@ struct globals {
 	Htaccess_Proxy *proxy;
 #endif
 	char iobuf[IOBUF_SIZE] ALIGN8;
+
+/* We also use the common buffer as a global buffer:
+ * = as input buffer for request line, headers, and POSTDATA
+ * = when retrieving ordinary file (not CGI, proxy, etc), we generate and store file's etag
+ */
+#define        hdr_buf bb_common_bufsiz1
+#define sizeof_hdr_buf COMMON_BUFSIZE
+#if ENABLE_FEATURE_HTTPD_ETAG
+#define        etag    bb_common_bufsiz1
+#endif
 };
-#define G (*ptr_to_globals)
+#define G (*OFFSET_PTR_TO_GLOBALS)
 #define verbose           (G.verbose          )
 #define flg_deny_all      (G.flg_deny_all     )
 #if ENABLE_FEATURE_HTTPD_GZIP
@@ -598,7 +602,7 @@ enum {
 #define iobuf             (G.iobuf            )
 #define INIT_G() do { \
 	setup_common_bufsiz(); \
-	SET_PTR_TO_GLOBALS(xzalloc(sizeof(G))); \
+	SET_OFFSET_PTR_TO_GLOBALS(xzalloc(sizeof(G))); \
 	IF_FEATURE_HTTPD_BASIC_AUTH(g_realm = "Web Server Authentication";) \
 	IF_FEATURE_HTTPD_RANGES(range_start = -1;) \
 	bind_addr_or_port = STR(CONFIG_FEATURE_HTTPD_PORT_DEFAULT); \
@@ -1300,7 +1304,7 @@ static void send_headers(unsigned responseNum)
 				date_str,
 #endif
 #if ENABLE_FEATURE_HTTPD_ETAG
-				G.etag,
+				etag,
 #endif
 				file_size
 		);
@@ -1712,19 +1716,19 @@ static void send_cgi_and_exit(
 		setenv1("REMOTE_ADDR", p);
 		if (cp) {
 			*cp = ':';
-#if ENABLE_FEATURE_HTTPD_SET_REMOTE_PORT_TO_ENV
+# if ENABLE_FEATURE_HTTPD_SET_REMOTE_PORT_TO_ENV
 			setenv1("REMOTE_PORT", cp + 1);
-#endif
+# endif
 		}
 	}
 	if (G.POST_len > 0)
 		putenv(xasprintf("CONTENT_LENGTH=%u", G.POST_len));
-#if ENABLE_FEATURE_HTTPD_BASIC_AUTH
+# if ENABLE_FEATURE_HTTPD_BASIC_AUTH
 	if (remoteuser) {
 		setenv1("REMOTE_USER", remoteuser);
 		putenv((char*)"AUTH_TYPE=Basic");
 	}
-#endif
+# endif
 	/* setenv1("SERVER_NAME", safe_gethostname()); - don't do this,
 	 * just run "env SERVER_NAME=xyz httpd ..." instead */
 
@@ -1768,24 +1772,14 @@ static void send_cgi_and_exit(
 		argv[0] = script;
 		argv[1] = NULL;
 
-#if ENABLE_FEATURE_HTTPD_CONFIG_WITH_SCRIPT_INTERPR
-		{
-			char *suffix = strrchr(script, '.');
-
-			if (suffix) {
-				Htaccess *cur;
-				for (cur = script_i; cur; cur = cur->next) {
-					if (strcmp(cur->before_colon + 1, suffix) == 0) {
-						/* found interpreter name */
-						argv[0] = cur->after_colon;
-						argv[1] = script;
-						argv[2] = NULL;
-						break;
-					}
-				}
-			}
+# if ENABLE_FEATURE_HTTPD_CONFIG_WITH_SCRIPT_INTERPR
+		if (script_i != NULL) {
+			/* found interpreter name */
+			argv[0] = script_i->after_colon;
+			argv[1] = script;
+			argv[2] = NULL;
 		}
-#endif
+# endif
 		if (VERBOSE_2)
 			bb_error_msg("exec:%s"IF_FEATURE_HTTPD_CONFIG_WITH_SCRIPT_INTERPR(" %s"),
 				argv[0]
@@ -1870,13 +1864,13 @@ static NOINLINE void send_file_and_exit(const char *url, int what)
 	}
 #if ENABLE_FEATURE_HTTPD_ETAG
 	/* ETag is "hex(last_mod)-hex(file_size)" e.g. "5e132e20-417" */
-	sprintf(G.etag, "\"%llx-%llx\"", (unsigned long long)last_mod, (unsigned long long)file_size);
+	sprintf(etag, "\"%llx-%llx\"", (unsigned long long)last_mod, (unsigned long long)file_size);
 
 	if (G.if_none_match) {
-		dbg("If-None-Match:'%s' file's ETag:'%s'\n", G.if_none_match, G.etag);
+		dbg("If-None-Match:'%s' file's ETag:'%s'\n", G.if_none_match, etag);
 		/* Weak ETag comparision.
 		 * If-None-Match may have many ETags but they are quoted so we can use simple substring search */
-		if (strstr(G.if_none_match, G.etag))
+		if (strstr(G.if_none_match, etag))
 			send_headers_and_exit(HTTP_NOT_MODIFIED);
 	}
 #endif
@@ -2546,13 +2540,22 @@ static void handle_incoming_and_exit(const len_and_sockaddr *fromAddr)
 
 #if ENABLE_FEATURE_HTTPD_CGI
 	if (is_prefixed_with(tptr, "cgi-bin/")) {
-		if (tptr[8] == '\0') {
-			/* protect listing "cgi-bin/" */
-			send_headers_and_exit(HTTP_FORBIDDEN);
-		}
+		script_i = NULL; /* no interpreter */
 		cgi_type = CGI_NORMAL;
-	} /* why "else": do not check "cgi-bin/SCRIPT/something" for cases below: */
-	else
+		if (stat(tptr, &sb) == 0) {
+			/* disallow anything but ordinary files in cgi-bin/ */
+			if (!S_ISREG(sb.st_mode))
+				send_headers_and_exit(HTTP_FORBIDDEN);
+			/* If non-executable, send it as a file:
+			 * apache compat: not every /cgi-bin/XYZ must be a script,
+			 * _can_ be just a data file */
+			if (!(sb.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH))) {
+				cgi_type = CGI_NONE;
+				goto exists;
+			} /* else: CGI_NORMAL, will attempt executing */
+		} /* else: CGI_NORMAL, will attempt executing */
+	}
+	else /* why "else": do not check "cgi-bin/SCRIPT/something" for cases below: */
 #endif
 	{
 		if (urlp[-1] == '/') {
@@ -2574,15 +2577,17 @@ static void handle_incoming_and_exit(const len_and_sockaddr *fromAddr)
 #if ENABLE_FEATURE_HTTPD_CONFIG_WITH_SCRIPT_INTERPR
 				char *suffix = strrchr(tptr, '.');
 				if (suffix) {
-					Htaccess *cur;
-					for (cur = script_i; cur; cur = cur->next) {
-						if (strcmp(cur->before_colon + 1, suffix) == 0) {
+					for (; script_i; script_i = script_i->next) {
+						if (strcmp(script_i->before_colon + 1, suffix) == 0) {
 							cgi_type = CGI_INTERPRETER;
 							break;
 						}
 					}
+				} else {
+					script_i = NULL;
 				}
 #endif
+ exists:
 				file_size = sb.st_size;
 				last_mod = sb.st_mtime;
 			}
