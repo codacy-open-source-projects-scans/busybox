@@ -101,16 +101,8 @@ gpt_list_table(int xtra UNUSED_PARAM)
 {
 	int i;
 	char numstr6[6];
-	unsigned long long total_bytes;
 
-	total_bytes = (unsigned long long)total_number_of_sectors * sector_size;
-	smart_ulltoa5(total_bytes, numstr6, " KMGTPEZY")[0] = '\0';
-
-	printf("Disk %s: %s, %llu bytes, %"SECT_FMT"u sectors\n", disk_device,
-		skip_whitespace(numstr6),
-		total_bytes,
-		(SECT_TYPE)total_number_of_sectors
-	);
+	list_disk_name_and_sizes();
 	printf("Logical sector size: %u\n", sector_size);
 	printf("Disk identifier (GUID): ");
 //util-linux 2.41.1 does not print " (GUID)" in above line,
@@ -119,8 +111,8 @@ gpt_list_table(int xtra UNUSED_PARAM)
 	printf("\nPartition table holds up to %u entries\n",
 		(int)SWAP_LE32(G.gpt_hdr->n_parts));
 	printf("First usable sector is %llu, last usable sector is %llu\n\n",
-		(unsigned long long)SWAP_LE64(G.gpt_hdr->first_usable_lba),
-		(unsigned long long)SWAP_LE64(G.gpt_hdr->last_usable_lba)
+		(ullong)SWAP_LE64(G.gpt_hdr->first_usable_lba),
+		(ullong)SWAP_LE64(G.gpt_hdr->last_usable_lba)
 	);
 
 /* "GPT fdisk" has a concept of 16-bit extension of the original MBR 8-bit type codes,
@@ -140,8 +132,8 @@ gpt_list_table(int xtra UNUSED_PARAM)
 				numstr6, " KMGTPEZY")[0] = '\0';
 			printf("%6u %15llu %15llu %s ",
 				i + 1,
-				(unsigned long long)SWAP_LE64(p->lba_start),
-				(unsigned long long)SWAP_LE64(p->lba_end),
+				(ullong)SWAP_LE64(p->lba_start),
+				(ullong)SWAP_LE64(p->lba_end),
 				numstr6
 			);
 			gpt_print_wide36(p->name36);
@@ -186,7 +178,7 @@ check_gpt_label(void)
 	G.gpt_hdr->hdr_crc32 = 0;
 	if (gpt_crc32(G.gpt_hdr, SWAP_LE32(G.gpt_hdr->hdr_size)) != crc) {
 		/* FIXME: read the backup table */
-		puts("\nwarning: GPT header CRC is invalid\n");
+		puts("\nwarning: GPT header CRC is invalid");
 	}
 
 	G.gpt_n_parts = SWAP_LE32(G.gpt_hdr->n_parts);
@@ -195,7 +187,7 @@ check_gpt_label(void)
 	 || G.gpt_part_entry_len > GPT_MAX_PART_ENTRY_LEN
 	 || SWAP_LE32(G.gpt_hdr->hdr_size) > sector_size
 	) {
-		puts("\nwarning: can't parse GPT disklabel\n");
+		puts("\nwarning: can't parse GPT disklabel");
 		current_label_type = LABEL_DOS;
 		return 0;
 	}
@@ -209,10 +201,10 @@ check_gpt_label(void)
 
 	if (gpt_crc32(G.gpt_part_array, part_array_len) != G.gpt_hdr->part_array_crc32) {
 		/* FIXME: read the backup table */
-		puts("\nwarning: GPT array CRC is invalid\n");
+		puts("\nwarning: GPT array CRC is invalid");
 	}
 
-	puts("Found valid GPT with protective MBR; using GPT\n");
+	puts("Found valid GPT with protective MBR; using GPT");
 
 	current_label_type = LABEL_GPT;
 	return 1;
