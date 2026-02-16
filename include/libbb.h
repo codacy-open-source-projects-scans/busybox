@@ -870,8 +870,11 @@ typedef struct tls_state {
 	int ofd;
 	int ifd;
 
-	unsigned min_encrypted_len_on_read;
+#if ENABLE_SSL_SERVER // || ENABLE_FEATURE_HTTPD_SSL
+	smallint expecting_first_packet;
+#endif
 	uint16_t cipher_id;
+	unsigned min_encrypted_len_on_read;
 	unsigned MAC_size;
 	unsigned key_size;
 	unsigned IV_size;
@@ -896,21 +899,27 @@ typedef struct tls_state {
 	/*uint64_t read_seq64_be;*/
 	uint64_t write_seq64_be;
 
-	/*uint8_t *server_write_MAC_key;*/
-	uint8_t *client_write_key;
-	uint8_t *server_write_key;
-	uint8_t *client_write_IV;
-	uint8_t *server_write_IV;
-	uint8_t client_write_MAC_key[TLS_MAX_MAC_SIZE];
-	uint8_t server_write_MAC_k__[TLS_MAX_MAC_SIZE];
-	uint8_t client_write_k__[TLS_MAX_KEY_SIZE];
-	uint8_t server_write_k__[TLS_MAX_KEY_SIZE];
-	uint8_t client_write_I_[TLS_MAX_IV_SIZE];
-	uint8_t server_write_I_[TLS_MAX_IV_SIZE];
+	uint8_t *our_write_MAC_key;
+	uint8_t *peer_write_MAC_key;
+	uint8_t *our_write_key;
+	uint8_t *peer_write_key;
+	uint8_t *our_write_IV;
+	uint8_t *peer_write_IV;
+	uint8_t key_block[TLS_MAX_MAC_SIZE];
+	uint8_t key_block2[TLS_MAX_MAC_SIZE];
+	uint8_t key_block3[TLS_MAX_KEY_SIZE];
+	uint8_t key_block4[TLS_MAX_KEY_SIZE];
+	uint8_t key_block5[TLS_MAX_IV_SIZE];
+	uint8_t key_block6[TLS_MAX_IV_SIZE];
 
 	struct tls_aes aes_encrypt;
 	struct tls_aes aes_decrypt;
 	uint8_t H[16]; //used by AES_GCM
+
+#if ENABLE_SSL_SERVER // || ENABLE_FEATURE_HTTPD_SSL
+	/* For ECDHE: server's ephemeral EC private key */
+	//uint8_t ecc_priv_key32[32];
+#endif
 } tls_state_t;
 
 static inline tls_state_t *new_tls_state(void)
@@ -918,7 +927,9 @@ static inline tls_state_t *new_tls_state(void)
 	tls_state_t *tls = xzalloc(sizeof(*tls));
 	return tls;
 }
-void tls_handshake(tls_state_t *tls, const char *sni) FAST_FUNC;
+void FAST_FUNC tls_handshake(tls_state_t *tls, const char *sni);
+void FAST_FUNC tls_handshake_as_server(tls_state_t *tls,
+	const char *pem_filename);
 #define TLSLOOP_EXIT_ON_LOCAL_EOF (1 << 0)
 void tls_run_copy_loop(tls_state_t *tls, unsigned flags) FAST_FUNC;
 
