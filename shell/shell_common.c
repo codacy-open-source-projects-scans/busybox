@@ -225,7 +225,7 @@ shell_builtin_read(struct builtin_read_params *params)
 				break;
 			}
 			retval = (const char *)(uintptr_t)1;
-			goto ret;
+			break;
 		}
 		if (read(fd, &buffer[bufpos], 1) != 1) {
 			err = errno;
@@ -279,7 +279,7 @@ shell_builtin_read(struct builtin_read_params *params)
 		}
  put:
 		bufpos++;
-	} while (--nchars);
+	} while (backslash || --nchars);
 
 	if (argv[0]) {
 		/* Remove trailing space $IFS chars */
@@ -332,7 +332,6 @@ shell_builtin_read(struct builtin_read_params *params)
 		params->setvar("REPLY", buffer);
 	}
 
- ret:
 	free(buffer);
 	if (read_flags & BUILTIN_READ_SILENT)
 		tcsetattr(fd, TCSANOW, &old_tty);

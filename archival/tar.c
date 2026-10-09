@@ -119,6 +119,7 @@
 #include "libbb.h"
 #include "common_bufsiz.h"
 #include "bb_archive.h"
+#include "unicode.h"
 /* FIXME: Stop using this non-standard feature */
 #ifndef FNM_LEADING_DIR
 # define FNM_LEADING_DIR 0
@@ -427,7 +428,7 @@ static int writeTarHeader(struct TarBallInfo *tbInfo,
 		/* GNU "tar cvvf" prints "extended" listing a-la "ls -l" */
 		/* We don't have such excesses here: for us "v" == "vv" */
 		/* '/' is probably a GNUism */
-		fprintf(vbFd, "%s%s\n", header_name,
+		fprintf(vbFd, "%s%s\n", printable_string(header_name),
 				S_ISDIR(statbuf->st_mode) ? "/" : "");
 	}
 
@@ -1132,6 +1133,9 @@ int tar_main(int argc UNUSED_PARAM, char **argv)
 
 	if (tar_handle->accept || tar_handle->reject)
 		tar_handle->filter = filter_accept_reject_list;
+
+	/* For "tar xvf/tvf" output and Unicode in names */
+	init_unicode();
 
 	/* Open the tar file */
 	{
